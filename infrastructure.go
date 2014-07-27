@@ -245,14 +245,12 @@ func (c *Client) trackRegisteredNtfns(cmd btcjson.Cmd) {
 
 		}
 
-	case *btcws.NotifySpentCmd:
+	case *btcws.FilterAddCmd:
 		for _, op := range bcmd.OutPoints {
-			c.ntfnState.notifySpent[op] = struct{}{}
+			c.ntfnState.filterOutPoints[op] = struct{}{}
 		}
-
-	case *btcws.NotifyReceivedCmd:
 		for _, addr := range bcmd.Addresses {
-			c.ntfnState.notifyReceived[addr] = struct{}{}
+			c.ntfnState.filterAddresses[addr] = struct{}{}
 		}
 	}
 }
@@ -476,30 +474,21 @@ func (c *Client) reregisterNtfns() error {
 		}
 	}
 
-	// Reregister the combination of all previously registered notifyspent
-	// outpoints in one command if needed.
-	nslen := len(stateCopy.notifySpent)
-	if nslen > 0 {
-		outpoints := make([]btcws.OutPoint, 0, nslen)
-		for op := range stateCopy.notifySpent {
+	// Reregister filters, if needed.
+	numAddrFilters := len(stateCopy.filterAddresses)
+	numOPFilters := len(stateCopy.filterOutPoints)
+	if numAddrFilters > 0 || numOPFilters > 0 {
+		addrs := make([]string, 0, numAddrFilters)
+		for addr := range stateCopy.filterAddresses {
+			addrs = append(addrs, addr)
+		}
+		outpoints := make([]btcws.OutPoint, 0, numOPFilters)
+		for op := range stateCopy.filterOutPoints {
 			outpoints = append(outpoints, op)
 		}
-		log.Debugf("Reregistering [notifyspent] outpoints: %v", outpoints)
-		if err := c.notifySpentInternal(outpoints).Receive(); err != nil {
-			return err
-		}
-	}
-
-	// Reregister the combination of all previously registered
-	// notifyreceived addresses in one command if needed.
-	nrlen := len(stateCopy.notifyReceived)
-	if nrlen > 0 {
-		addresses := make([]string, 0, nrlen)
-		for addr := range stateCopy.notifyReceived {
-			addresses = append(addresses, addr)
-		}
-		log.Debugf("Reregistering [notifyreceived] addresses: %v", addresses)
-		if err := c.notifyReceivedInternal(addresses).Receive(); err != nil {
+		log.Debugf("Reregistering [filteradd] filters: addresses %v "+
+			"outpoints %v", addrs, outpoints)
+		if err := c.filterAddInternal(addrs, outpoints).Receive(); err != nil {
 			return err
 		}
 	}

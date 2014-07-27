@@ -36,8 +36,8 @@ type notificationState struct {
 	notifyBlocks       bool
 	notifyNewTx        bool
 	notifyNewTxVerbose bool
-	notifyReceived     map[string]struct{}
-	notifySpent        map[btcws.OutPoint]struct{}
+	filterAddresses    map[string]struct{}
+	filterOutPoints    map[btcws.OutPoint]struct{}
 }
 
 // Copy returns a deep copy of the receiver.
@@ -48,13 +48,13 @@ func (s *notificationState) Copy() *notificationState {
 	defer s.Unlock()
 
 	stateCopy := *s
-	stateCopy.notifyReceived = make(map[string]struct{})
-	for addr := range s.notifyReceived {
-		stateCopy.notifyReceived[addr] = struct{}{}
+	stateCopy.filterAddresses = make(map[string]struct{})
+	for addr := range s.filterAddresses {
+		stateCopy.filterAddresses[addr] = struct{}{}
 	}
-	stateCopy.notifySpent = make(map[btcws.OutPoint]struct{})
-	for op := range s.notifySpent {
-		stateCopy.notifySpent[op] = struct{}{}
+	stateCopy.filterOutPoints = make(map[btcws.OutPoint]struct{})
+	for op := range s.filterOutPoints {
+		stateCopy.filterOutPoints[op] = struct{}{}
 	}
 
 	return &stateCopy
@@ -63,8 +63,8 @@ func (s *notificationState) Copy() *notificationState {
 // newNotificationState returns a new notification state ready to be populated.
 func newNotificationState() *notificationState {
 	return &notificationState{
-		notifyReceived: make(map[string]struct{}),
-		notifySpent:    make(map[btcws.OutPoint]struct{}),
+		filterAddresses: make(map[string]struct{}),
+		filterOutPoints: make(map[btcws.OutPoint]struct{}),
 	}
 }
 
@@ -105,24 +105,9 @@ type NotificationHandlers struct {
 	// function is non-nil.
 	OnBlockDisconnected func(hash *btcwire.ShaHash, height int32)
 
-	// OnRecvTx is invoked when a transaction that receives funds to a
-	// registered address is received into the memory pool and also
-	// connected to the longest (best) chain.  It will only be invoked if a
-	// preceding call to NotifyReceived, Rescan, or RescanEndHeight has been
-	// made to register for the notification and the function is non-nil.
-	OnRecvTx func(transaction *btcutil.Tx, details *btcws.BlockDetails)
+	OnMerkleBlock func(merkleBlock *btcwire.MsgMerkleBlock, txs []*btcutil.Tx)
 
-	// OnRedeemingTx is invoked when a transaction that spends a registered
-	// outpoint is received into the memory pool and also connected to the
-	// longest (best) chain.  It will only be invoked if a preceding call to
-	// NotifySpent, Rescan, or RescanEndHeight has been made to register for
-	// the notification and the function is non-nil.
-	//
-	// NOTE: The NotifyReceived will automatically register notifications
-	// for the outpoints that are now "owned" as a result of receiving
-	// funds to the registered addresses.  This means it is possible for
-	// this to invoked indirectly as the result of a NotifyReceived call.
-	OnRedeemingTx func(transaction *btcutil.Tx, details *btcws.BlockDetails)
+	OnFilteredTx func(tx *btcutil.Tx)
 
 	// OnRescanFinished is invoked after a rescan finishes due to a previous
 	// call to Rescan or RescanEndHeight.  Finished rescans should be
@@ -221,39 +206,39 @@ func (c *Client) handleNotification(ntfn *rawNotification) {
 
 		c.ntfnHandlers.OnBlockDisconnected(blockSha, blockHeight)
 
-	// OnRecvTx
-	case btcws.RecvTxNtfnMethod:
+	// OnMerkleBlock
+	case btcws.MerkleBlockNtfnMethod:
 		// Ignore the notification if the client is not interested in
 		// it.
-		if c.ntfnHandlers.OnRecvTx == nil {
+		if c.ntfnHandlers.OnMerkleBlock == nil {
 			return
 		}
 
-		tx, block, err := parseChainTxNtfnParams(ntfn.Params)
+		merkleBlock, txs, err := parseMerkleBlockParams(ntfn.Params)
 		if err != nil {
-			log.Warnf("Received invalid recvtx notification: %v",
-				err)
-			return
-		}
-
-		c.ntfnHandlers.OnRecvTx(tx, block)
-
-	// OnRedeemingTx
-	case btcws.RedeemingTxNtfnMethod:
-		// Ignore the notification if the client is not interested in
-		// it.
-		if c.ntfnHandlers.OnRedeemingTx == nil {
-			return
-		}
-
-		tx, block, err := parseChainTxNtfnParams(ntfn.Params)
-		if err != nil {
-			log.Warnf("Received invalid redeemingtx "+
+			log.Warnf("Received invalid merkleblock "+
 				"notification: %v", err)
 			return
 		}
 
-		c.ntfnHandlers.OnRedeemingTx(tx, block)
+		c.ntfnHandlers.OnMerkleBlock(merkleBlock, txs)
+
+	// OnFilteredTx
+	case btcws.FilteredTxNtfnMethod:
+		// Ignore the notification if the client is not interested in
+		// it.
+		if c.ntfnHandlers.OnFilteredTx == nil {
+			return
+		}
+
+		tx, err := parseFilteredTxParams(ntfn.Params)
+		if err != nil {
+			log.Warnf("Received invalid filteredtx "+
+				"notification: %v", err)
+			return
+		}
+
+		c.ntfnHandlers.OnFilteredTx(tx)
 
 	// OnRescanFinished
 	case btcws.RescanFinishedNtfnMethod:
@@ -429,48 +414,85 @@ func parseChainNtfnParams(params []json.RawMessage) (*btcwire.ShaHash,
 	return blockSha, blockHeight, nil
 }
 
-// parseChainTxNtfnParams parses out the transaction and optional details about
-// the block it's mined in from the parameters of recvtx and redeemingtx
-// notifications.
-func parseChainTxNtfnParams(params []json.RawMessage) (*btcutil.Tx,
-	*btcws.BlockDetails, error) {
+// parseMerkleBlockParams parses out a merkle block and the relevant
+// transactions from a merkleblock notification.
+func parseMerkleBlockParams(params []json.RawMessage) (*btcwire.MsgMerkleBlock,
+	[]*btcutil.Tx, error) {
 
-	if len(params) == 0 || len(params) > 2 {
+	if len(params) != 2 {
 		return nil, nil, wrongNumParams(len(params))
+	}
+
+	// Unmarshal first parameter as a string.
+	var merkleBlockHex string
+	err := json.Unmarshal(params[0], &merkleBlockHex)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Unmarshal second parameter as an array of strings.
+	var matchedTxs []string
+	err = json.Unmarshal(params[1], &matchedTxs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Decode merkle block.
+	merkleBlock := new(btcwire.MsgMerkleBlock)
+	serializedMerkleBlock, err := hex.DecodeString(merkleBlockHex)
+	if err != nil {
+		return nil, nil, err
+	}
+	err = merkleBlock.BtcDecode(bytes.NewReader(serializedMerkleBlock),
+		btcwire.BIP0037Version)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Hex decode and deserialize each matched transaction.
+	txs := make([]*btcutil.Tx, len(matchedTxs))
+	for i, hexTx := range matchedTxs {
+		serializedTx, err := hex.DecodeString(hexTx)
+		if err != nil {
+			return nil, nil, err
+		}
+		msgTx := new(btcwire.MsgTx)
+		msgTx.Deserialize(bytes.NewReader(serializedTx))
+		if err != nil {
+			return nil, nil, err
+		}
+		txs[i] = btcutil.NewTx(msgTx)
+	}
+
+	return merkleBlock, txs, nil
+}
+
+// parseFilteredTxParams parses out a transaction from the parameters of a
+// filteredtx notification.
+func parseFilteredTxParams(params []json.RawMessage) (*btcutil.Tx, error) {
+	if len(params) != 1 {
+		return nil, wrongNumParams(len(params))
 	}
 
 	// Unmarshal first parameter as a string.
 	var txHex string
 	err := json.Unmarshal(params[0], &txHex)
 	if err != nil {
-		return nil, nil, err
-	}
-
-	// If present, unmarshal second optional parameter as the block details
-	// JSON object.
-	var block *btcws.BlockDetails
-	if len(params) > 1 {
-		err = json.Unmarshal(params[1], &block)
-		if err != nil {
-			return nil, nil, err
-		}
+		return nil, err
 	}
 
 	// Hex decode and deserialize the transaction.
 	serializedTx, err := hex.DecodeString(txHex)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	var msgTx btcwire.MsgTx
 	err = msgTx.Deserialize(bytes.NewReader(serializedTx))
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	// TODO: Change recvtx and redeemingtx callback signatures to use
-	// nicer types for details about the block (block sha as a
-	// btcwire.ShaHash, block time as a time.Time, etc.).
-	return btcutil.NewTx(&msgTx), block, nil
+	return btcutil.NewTx(&msgTx), nil
 }
 
 // parseRescanProgressParams parses out the height of the last rescanned block
@@ -712,10 +734,10 @@ func (r FutureNotifySpentResult) Receive() error {
 	return nil
 }
 
-// notifySpentInternal is the same as notifySpentAsync except it accepts
-// the converted outpoints as a parameter so the client can more efficiently
-// recreate the previous notification state on reconnect.
-func (c *Client) notifySpentInternal(outpoints []btcws.OutPoint) FutureNotifySpentResult {
+// filterAddInternal is the same as filterAddInternalAsync except it accepts
+// the converted address strings and outpoints as a parameter so the client
+// can more efficiently recreate the previous filter on reconnect.
+func (c *Client) filterAddInternal(addrs []string, outpoints []btcws.OutPoint) FutureNotifySpentResult {
 	// Not supported in HTTP POST mode.
 	if c.config.HttpPostMode {
 		return newFutureError(ErrNotificationsNotSupported)
@@ -728,19 +750,21 @@ func (c *Client) notifySpentInternal(outpoints []btcws.OutPoint) FutureNotifySpe
 	}
 
 	id := c.NextID()
-	cmd := btcws.NewNotifySpentCmd(id, outpoints)
+	cmd := btcws.NewFilterAddCmd(id, addrs, outpoints)
 
 	return c.sendCmd(cmd)
 }
 
-// NotifySpentAsync returns an instance of a type that can be used to get the
+// FilterAddAsync returns an instance of a type that can be used to get the
 // result of the RPC at some future time by invoking the Receive function on
 // the returned instance.
 //
-// See NotifySpent for the blocking version and more details.
+// See FilterAdd for the blocking version and more details.
 //
 // NOTE: This is a btcd extension and requires a websocket connection.
-func (c *Client) NotifySpentAsync(outpoints []*btcwire.OutPoint) FutureNotifySpentResult {
+func (c *Client) FilterAddAsync(addresses []btcutil.Address,
+	outpoints []*btcwire.OutPoint) FutureNotifySpentResult {
+
 	// Not supported in HTTP POST mode.
 	if c.config.HttpPostMode {
 		return newFutureError(ErrNotificationsNotSupported)
@@ -753,27 +777,34 @@ func (c *Client) NotifySpentAsync(outpoints []*btcwire.OutPoint) FutureNotifySpe
 	}
 
 	id := c.NextID()
-	ops := make([]btcws.OutPoint, 0, len(outpoints))
-	for _, outpoint := range outpoints {
-		ops = append(ops, *btcws.NewOutPointFromWire(outpoint))
+	addrs := make([]string, len(addresses))
+	for i, addr := range addresses {
+		addrs[i] = addr.String()
 	}
-	cmd := btcws.NewNotifySpentCmd(id, ops)
+	ops := make([]btcws.OutPoint, len(outpoints))
+	for i, outpoint := range outpoints {
+		ops[i] = btcws.NewOutPointFromWire(outpoint)
+	}
+	cmd := btcws.NewFilterAddCmd(id, addrs, ops)
 
 	return c.sendCmd(cmd)
 }
 
-// NotifySpent registers the client to receive notifications when the passed
-// transaction outputs are spent.  The notifications are delivered to the
-// notification handlers associated with the client.  Calling this function has
-// no effect if there are no notification handlers and will result in an error
-// if the client is configured to run in HTTP POST mode.
+// FilterAdd registers the client to receive notifications when the a block is
+// connected or a mempool transaction is accepted that pays to one of the passed
+// addresses or spends one of the passed outpoints.  The notifications are
+// delivered to the notification handlers associated with the client.  Calling
+// this function has  no effect if there are no notification handlers and will
+// result in an error if the client is configured to run in HTTP POST mode.
 //
 // The notifications delivered as a result of this call will be via
-// OnRedeemingTx.
+// OnFilteredTx and OnMerkleBlock.
 //
 // NOTE: This is a btcd extension and requires a websocket connection.
-func (c *Client) NotifySpent(outpoints []*btcwire.OutPoint) error {
-	return c.NotifySpentAsync(outpoints).Receive()
+func (c *Client) FilterAdd(addresses []btcutil.Address,
+	outpoints []*btcwire.OutPoint) error {
+
+	return c.FilterAddAsync(addresses, outpoints).Receive()
 }
 
 // FutureNotifyNewTransactionsResult is a future promise to deliver the result
@@ -834,94 +865,6 @@ func (c *Client) NotifyNewTransactions(verbose bool) error {
 	return c.NotifyNewTransactionsAsync(verbose).Receive()
 }
 
-// FutureNotifyReceivedResult is a future promise to deliver the result of a
-// NotifyReceivedAsync RPC invocation (or an applicable error).
-type FutureNotifyReceivedResult chan *response
-
-// Receive waits for the response promised by the future and returns an error
-// if the registration was not successful.
-func (r FutureNotifyReceivedResult) Receive() error {
-	_, err := receiveFuture(r)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// notifyReceivedInternal is the same as notifyReceivedAsync except it accepts
-// the converted addresses as a parameter so the client can more efficiently
-// recreate the previous notification state on reconnect.
-func (c *Client) notifyReceivedInternal(addresses []string) FutureNotifyReceivedResult {
-	// Not supported in HTTP POST mode.
-	if c.config.HttpPostMode {
-		return newFutureError(ErrNotificationsNotSupported)
-	}
-
-	// Ignore the notification if the client is not interested in
-	// notifications.
-	if c.ntfnHandlers == nil {
-		return newNilFutureResult()
-	}
-
-	// Convert addresses to strings.
-	id := c.NextID()
-	cmd := btcws.NewNotifyReceivedCmd(id, addresses)
-
-	return c.sendCmd(cmd)
-}
-
-// NotifyReceivedAsync returns an instance of a type that can be used to get the
-// result of the RPC at some future time by invoking the Receive function on
-// the returned instance.
-//
-// See NotifyReceived for the blocking version and more details.
-//
-// NOTE: This is a btcd extension and requires a websocket connection.
-func (c *Client) NotifyReceivedAsync(addresses []btcutil.Address) FutureNotifyReceivedResult {
-	// Not supported in HTTP POST mode.
-	if c.config.HttpPostMode {
-		return newFutureError(ErrNotificationsNotSupported)
-	}
-
-	// Ignore the notification if the client is not interested in
-	// notifications.
-	if c.ntfnHandlers == nil {
-		return newNilFutureResult()
-	}
-
-	// Convert addresses to strings.
-	addrs := make([]string, 0, len(addresses))
-	for _, addr := range addresses {
-		addrs = append(addrs, addr.String())
-	}
-	id := c.NextID()
-	cmd := btcws.NewNotifyReceivedCmd(id, addrs)
-
-	return c.sendCmd(cmd)
-}
-
-// NotifyReceived registers the client to receive notifications every time a
-// new transaction which pays to one of the passed addresses is accepted to
-// memory pool or in a block connected to the block chain.  In addition, when
-// one of these transactions is detected, the client is also automatically
-// registered for notifications when the new transaction outpoints the address
-// now has available are spent (See NotifySpent).  The notifications are
-// delivered to the notification handlers associated with the client.  Calling
-// this function has no effect if there are no notification handlers and will
-// result in an error if the client is configured to run in HTTP POST mode.
-//
-// The notifications delivered as a result of this call will be via one of
-// *OnRecvTx (for transactions that receive funds to one of the passed
-// addresses) or OnRedeemingTx (for transactions which spend from one
-// of the outpoints which are automatically registered upon receipt of funds to
-// the address).
-//
-// NOTE: This is a btcd extension and requires a websocket connection.
-func (c *Client) NotifyReceived(addresses []btcutil.Address) error {
-	return c.NotifyReceivedAsync(addresses).Receive()
-}
-
 // FutureRescanResult is a future promise to deliver the result of a RescanAsync
 // or RescanEndHeightAsync RPC invocation (or an applicable error).
 type FutureRescanResult chan *response
@@ -980,7 +923,7 @@ func (c *Client) RescanAsync(startBlock *btcwire.ShaHash,
 	// Convert outpoints.
 	ops := make([]btcws.OutPoint, 0, len(outpoints))
 	for _, op := range outpoints {
-		ops = append(ops, *btcws.NewOutPointFromWire(op))
+		ops = append(ops, btcws.NewOutPointFromWire(op))
 	}
 
 	id := c.NextID()
@@ -1065,7 +1008,7 @@ func (c *Client) RescanEndBlockAsync(startBlock *btcwire.ShaHash,
 	// Convert outpoints.
 	ops := make([]btcws.OutPoint, 0, len(outpoints))
 	for _, op := range outpoints {
-		ops = append(ops, *btcws.NewOutPointFromWire(op))
+		ops = append(ops, btcws.NewOutPointFromWire(op))
 	}
 
 	id := c.NextID()
